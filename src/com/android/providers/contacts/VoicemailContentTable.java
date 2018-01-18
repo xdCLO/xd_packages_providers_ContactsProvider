@@ -58,11 +58,12 @@ public class VoicemailContentTable implements VoicemailTable.Delegate {
 
     private static final String[] FILENAME_ONLY_PROJECTION = new String[] {Voicemails._DATA};
 
-    private static final ImmutableSet<String> ALLOWED_COLUMNS = new ImmutableSet.Builder<String>()
+    public static final ImmutableSet<String> ALLOWED_COLUMNS = new ImmutableSet.Builder<String>()
             .add(Voicemails._ID)
             .add(Voicemails.NUMBER)
             .add(Voicemails.DATE)
             .add(Voicemails.DURATION)
+            .add(Voicemails.NEW)
             .add(Voicemails.IS_READ)
             .add(Voicemails.TRANSCRIPTION)
             .add(Voicemails.TRANSCRIPTION_STATE)
@@ -104,6 +105,7 @@ public class VoicemailContentTable implements VoicemailTable.Delegate {
                 .add(Voicemails.NUMBER)
                 .add(Voicemails.DATE)
                 .add(Voicemails.DURATION)
+                .add(Voicemails.NEW)
                 .add(Voicemails.IS_READ)
                 .add(Voicemails.TRANSCRIPTION)
                 .add(Voicemails.TRANSCRIPTION_STATE)
