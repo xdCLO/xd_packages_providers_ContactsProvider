@@ -16,6 +16,10 @@
 
 package com.android.providers.contacts;
 
+import static android.content.pm.PackageManager.PERMISSION_GRANTED;
+import static android.Manifest.permission.INTERACT_ACROSS_USERS;
+import static android.Manifest.permission.INTERACT_ACROSS_USERS_FULL;
+
 import android.accounts.Account;
 import android.accounts.AccountManager;
 import android.accounts.OnAccountsUpdateListener;
@@ -214,7 +218,6 @@ public class ContactsProvider2 extends AbstractContactsProvider
 
     private static final String READ_PERMISSION = "android.permission.READ_CONTACTS";
     private static final String WRITE_PERMISSION = "android.permission.WRITE_CONTACTS";
-    private static final String INTERACT_ACROSS_USERS = "android.permission.INTERACT_ACROSS_USERS";
 
 
     /* package */ static final String PHONEBOOK_COLLATOR_NAME = "PHONEBOOK";
@@ -2606,7 +2609,8 @@ public class ContactsProvider2 extends AbstractContactsProvider
     protected Uri insertInTransaction(Uri uri, ContentValues values) {
         if (VERBOSE_LOGGING) {
             Log.v(TAG, "insertInTransaction: uri=" + uri + "  values=[" + values + "]" +
-                    " CPID=" + Binder.getCallingPid());
+                    " CPID=" + Binder.getCallingPid() +
+                    " CUID=" + Binder.getCallingUid());
         }
 
         final SQLiteDatabase db = mDbHelper.get().getWritableDatabase();
@@ -3550,6 +3554,7 @@ public class ContactsProvider2 extends AbstractContactsProvider
             Log.v(TAG, "deleteInTransaction: uri=" + uri +
                     "  selection=[" + selection + "]  args=" + Arrays.toString(selectionArgs) +
                     " CPID=" + Binder.getCallingPid() +
+                    " CUID=" + Binder.getCallingUid() +
                     " User=" + UserUtils.getCurrentUserHandle(getContext()));
         }
 
@@ -3802,15 +3807,25 @@ public class ContactsProvider2 extends AbstractContactsProvider
     }
 
     private int deleteContact(long contactId, boolean callerIsSyncAdapter) {
+        ArrayList<Long> localRawContactIds = new ArrayList();
+
         final SQLiteDatabase db = mDbHelper.get().getWritableDatabase();
         mSelectionArgs1[0] = Long.toString(contactId);
         Cursor c = db.query(Tables.RAW_CONTACTS, new String[] {RawContacts._ID},
                 RawContacts.CONTACT_ID + "=?", mSelectionArgs1,
                 null, null, null);
+
+        // Raw contacts need to be deleted after the contact so just loop through and mark
+        // non-local raw contacts as deleted and collect the local raw contacts that will be
+        // deleted after the contact is deleted.
         try {
             while (c.moveToNext()) {
                 long rawContactId = c.getLong(0);
-                markRawContactAsDeleted(db, rawContactId, callerIsSyncAdapter);
+                if (rawContactIsLocal(rawContactId)) {
+                    localRawContactIds.add(rawContactId);
+                } else {
+                    markRawContactAsDeleted(db, rawContactId, callerIsSyncAdapter);
+                }
             }
         } finally {
             c.close();
@@ -3819,6 +3834,10 @@ public class ContactsProvider2 extends AbstractContactsProvider
         mProviderStatusUpdateNeeded = true;
 
         int result = ContactsTableUtil.deleteContact(db, contactId);
+
+        // Now purge the local raw contacts
+        deleteRawContactsImmediately(db, localRawContactIds);
+
         scheduleBackgroundTask(BACKGROUND_TASK_CLEAN_DELETE_LOG);
         return result;
     }
@@ -3842,19 +3861,19 @@ public class ContactsProvider2 extends AbstractContactsProvider
             c.close();
         }
 
+        // When a raw contact is deleted, a sqlite trigger deletes the parent contact.
+        // TODO: all contact deletes was consolidated into ContactTableUtil but this one can't
+        // because it's in a trigger.  Consider removing trigger and replacing with java code.
+        // This has to happen before the raw contact is deleted since it relies on the number
+        // of raw contacts.
         final boolean contactIsSingleton =
                 ContactsTableUtil.deleteContactIfSingleton(db, rawContactId) == 1;
         final int count;
 
         if (callerIsSyncAdapter || rawContactIsLocal(rawContactId)) {
-            // When a raw contact is deleted, a SQLite trigger deletes the parent contact.
-            // TODO: all contact deletes was consolidated into ContactTableUtil but this one can't
-            // because it's in a trigger.  Consider removing trigger and replacing with java code.
-            // This has to happen before the raw contact is deleted since it relies on the number
-            // of raw contacts.
-            db.delete(Tables.PRESENCE, PresenceColumns.RAW_CONTACT_ID + "=" + rawContactId, null);
-            count = db.delete(Tables.RAW_CONTACTS, RawContacts._ID + "=" + rawContactId, null);
-            mTransactionContext.get().markRawContactChangedOrDeletedOrInserted(rawContactId);
+            ArrayList<Long> rawContactsIds = new ArrayList<>();
+            rawContactsIds.add(rawContactId);
+            count = deleteRawContactsImmediately(db, rawContactsIds);
         } else {
             count = markRawContactAsDeleted(db, rawContactId, callerIsSyncAdapter);
         }
@@ -3862,6 +3881,43 @@ public class ContactsProvider2 extends AbstractContactsProvider
             mAggregator.get().updateAggregateData(mTransactionContext.get(), contactId);
         }
         return count;
+    }
+
+    /**
+     * Returns the number of raw contacts that were deleted immediately -- we don't merely set
+     * the DELETED column to 1, the entire raw contact row is deleted straightaway.
+     */
+    private int deleteRawContactsImmediately(SQLiteDatabase db, List<Long> rawContactIds) {
+        if (rawContactIds == null || rawContactIds.isEmpty()) {
+            return 0;
+        }
+
+        // Build the where clause for the raw contacts to be deleted
+        ArrayList<String> whereArgs = new ArrayList<>();
+        StringBuilder whereClause = new StringBuilder(rawContactIds.size() * 2 - 1);
+        whereClause.append(" IN (?");
+        whereArgs.add(String.valueOf(rawContactIds.get(0)));
+        for (int i = 1; i < rawContactIds.size(); i++) {
+            whereClause.append(",?");
+            whereArgs.add(String.valueOf(rawContactIds.get(i)));
+        }
+        whereClause.append(")");
+
+        // Remove presence rows
+        db.delete(Tables.PRESENCE, PresenceColumns.RAW_CONTACT_ID + whereClause.toString(),
+                whereArgs.toArray(new String[0]));
+
+        // Remove raw contact rows
+        int result = db.delete(Tables.RAW_CONTACTS, RawContacts._ID + whereClause.toString(),
+                whereArgs.toArray(new String[0]));
+
+        if (result > 0) {
+            for (Long rawContactId : rawContactIds) {
+                mTransactionContext.get().markRawContactChangedOrDeletedOrInserted(rawContactId);
+            }
+        }
+
+        return result;
     }
 
     /**
@@ -3964,6 +4020,7 @@ public class ContactsProvider2 extends AbstractContactsProvider
             Log.v(TAG, "updateInTransaction: uri=" + uri +
                     "  selection=[" + selection + "]  args=" + Arrays.toString(selectionArgs) +
                     "  values=[" + values + "] CPID=" + Binder.getCallingPid() +
+                    " CUID=" + Binder.getCallingUid() +
                     " User=" + UserUtils.getCurrentUserHandle(getContext()));
         }
 
@@ -5441,6 +5498,7 @@ public class ContactsProvider2 extends AbstractContactsProvider
             Log.v(TAG, "query: uri=" + uri + "  projection=" + Arrays.toString(projection) +
                     "  selection=[" + selection + "]  args=" + Arrays.toString(selectionArgs) +
                     "  order=[" + sortOrder + "] CPID=" + Binder.getCallingPid() +
+                    " CUID=" + Binder.getCallingUid() +
                     " User=" + UserUtils.getCurrentUserHandle(getContext()));
         }
 
@@ -5454,9 +5512,13 @@ public class ContactsProvider2 extends AbstractContactsProvider
             return null;
         }
 
-        // Check enterprise policy if caller does not come from same profile
-        if (!(isCallerFromSameUser() || mEnterprisePolicyGuard.isCrossProfileAllowed(uri))) {
-            return createEmptyCursor(uri, projection);
+        // If caller does not come from same profile, Check if it's privileged or allowed by
+        // enterprise policy
+        if (!isCallerFromSameUser()) {
+            if (!callerHoldsInteractAcrossUserPermission()
+                    && !mEnterprisePolicyGuard.isCrossProfileAllowed(uri)) {
+                return createEmptyCursor(uri, projection);
+            }
         }
         // Query the profile DB if appropriate.
         if (mapsToProfileDb(uri)) {
@@ -5480,6 +5542,12 @@ public class ContactsProvider2 extends AbstractContactsProvider
     private boolean isCallerFromSameUser() {
         return Binder.getCallingUserHandle().getIdentifier() == UserUtils
                 .getCurrentUserHandle(getContext());
+    }
+
+    private boolean callerHoldsInteractAcrossUserPermission() {
+        final Context context = getContext();
+        return context.checkCallingPermission(INTERACT_ACROSS_USERS_FULL) == PERMISSION_GRANTED
+                || context.checkCallingPermission(INTERACT_ACROSS_USERS) == PERMISSION_GRANTED;
     }
 
     private Cursor queryDirectoryIfNecessary(Uri uri, String[] projection, String selection,
@@ -8525,10 +8593,12 @@ public class ContactsProvider2 extends AbstractContactsProvider
             if (!isDirectoryParamValid(uri)){
                 return null;
             }
-            if (!isCallerFromSameUser() /* From differnt user */
-                    && !mEnterprisePolicyGuard.isCrossProfileAllowed(uri)
-                    /* Policy not allowed */){
-                return null;
+            if (!isCallerFromSameUser()) { /* From differnt user */
+                if (!callerHoldsInteractAcrossUserPermission() /* no cross user permission */
+                        && !mEnterprisePolicyGuard.isCrossProfileAllowed(uri)
+                        /* Policy not allowed */){
+                    return null;
+                }
             }
             waitForAccess(mode.equals("r") ? mReadAccessLatch : mWriteAccessLatch);
             final AssetFileDescriptor ret;
@@ -8545,6 +8615,7 @@ public class ContactsProvider2 extends AbstractContactsProvider
             if (VERBOSE_LOGGING) {
                 Log.v(TAG, "openAssetFile uri=" + uri + " mode=" + mode + " success=" + success +
                         " CPID=" + Binder.getCallingPid() +
+                        " CUID=" + Binder.getCallingUid() +
                         " User=" + UserUtils.getCurrentUserHandle(getContext()));
             }
         }
